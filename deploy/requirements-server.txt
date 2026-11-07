@@ -1,0 +1,7 @@
+# Server image deps. torch is installed separately from the CPU-only index (see Dockerfile)
+# so the image does not pull ~3 GB of CUDA libraries onto a GPU-less server.
+sentence-transformers==6.2.0
+rank_bm25==0.2.2
+numpy>=2.0,<3
+fastapi>=0.115
+uvicorn>=0.30

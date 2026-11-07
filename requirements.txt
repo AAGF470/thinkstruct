@@ -1,0 +1,7 @@
+# Python 3.12. CPU-only is fine for the small dataset.
+sentence-transformers>=6.2
+rank_bm25>=0.2.2
+numpy>=2.0
+# web app (app/) - only needed to run the API locally
+fastapi>=0.115
+uvicorn>=0.30

@@ -1,0 +1,36 @@
+# --- Data (not committed; see README for where to place it) ---
+UTF-8patent_data_small/
+coding_challenge_large_data/
+*.zip
+
+# Task brief from Thinkstruct
+thinkstruct-coding-task.pdf
+
+# Personal notes (video script etc.), not part of the submission
+notes/
+
+# --- Generated artifacts (rebuilt by the indexer) ---
+cache/
+deploy/index/
+deploy/*.tar.gz
+deploy/htpasswd
+*.npy
+*.npz
+*.pkl
+
+# --- Web (Node) ---
+web/node_modules/
+web/dist/
+.npmrc
+
+# --- Python ---
+.venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,16 @@
+# Keep the build context tiny: the data folders alone are 32 GB.
+UTF-8patent_data_small/
+coding_challenge_large_data/
+cache/
+deploy/index/
+deploy/*.tar.gz
+deploy/htpasswd
+results/
+web/
+notes/
+.venv/
+.git/
+**/__pycache__/
+*.pdf
+*.md
+!deploy/requirements-server.txt

@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Patent Search</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66;
+    --line: #e3e3de; --accent: #2457c5; --accent-soft: #e8eefb; --claim: #f3f3ef;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #151514; --panel: #1e1e1c; --text: #ecece8; --muted: #9a9a93;
+      --line: #33332f; --accent: #7fa6ff; --accent-soft: #233150; --claim: #262623;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #151514; --panel: #1e1e1c; --text: #ecece8; --muted: #9a9a93;
+    --line: #33332f; --accent: #7fa6ff; --accent-soft: #233150; --claim: #262623;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 920px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  form { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .row + .row { margin-top: 8px; }
+  input, select, button { font: inherit; color: inherit; background: var(--bg);
+         border: 1px solid var(--line); border-radius: 7px; padding: 7px 10px; min-width: 0; }
+  input[name=q] { flex: 1 1 100%; }
+  .grow { flex: 1 1 160px; }
+  button { background: var(--accent); color: #fff; border: 0; cursor: pointer; padding: 7px 16px; }
+  label.chk { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+  #meta { color: var(--muted); font-size: 12.5px; margin: 14px 2px 8px; min-height: 18px; }
+  .err { color: #c0392b; }
+  .res { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+         padding: 12px 14px; margin-bottom: 10px; }
+  .top { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; font-size: 12.5px; color: var(--muted); }
+  .rank { font-weight: 600; color: var(--text); }
+  .tag { background: var(--accent-soft); color: var(--accent); border-radius: 5px; padding: 0 6px; }
+  .title { font-weight: 600; margin: 4px 0; overflow-wrap: anywhere; }
+  .claim { background: var(--claim); border-radius: 7px; padding: 8px 10px; font-size: 13.5px; overflow-wrap: anywhere; }
+  .claim b { color: var(--accent); }
+  .terms { font-size: 12.5px; color: var(--muted); margin-top: 6px; }
+  a { color: var(--accent); cursor: pointer; text-decoration: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Patent search</h1>
+  <div class="sub" id="info">Loading index…</div>
+  <form id="f">
+    <div class="row"><input name="q" placeholder="Describe an invention, or paste a claim" autofocus></div>
+    <div class="row">
+      <input class="grow" name="cpc" placeholder="CPC prefixes, comma-separated (B60B, B60C 23/)">
+      <input class="grow" name="kw" placeholder="Keywords in title/abstract (comma = AND)">
+    </div>
+    <div class="row">
+      <select name="mode"><option value="hybrid">hybrid</option><option value="dense">dense</option><option value="bm25">keyword (BM25)</option></select>
+      <select name="k"><option>10</option><option>20</option><option>30</option></select>
+      <label class="chk"><input type="checkbox" name="rerank" id="rr" disabled> rerank</label>
+      <button type="submit">Search</button>
+    </div>
+  </form>
+  <div id="meta"></div>
+  <div id="out"></div>
+</main>
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+let seq = 0, ctrl = null;  // only the newest request may render (no stale results)
+
+fetch("api/health").then(r => r.json()).then(h => {
+  $("#info").textContent = `${h.n_patents} patents · ${h.model} (${h.dim}-d) · ` +
+    (h.rerank_enabled ? `rerank: ${h.reranker}` : "rerank disabled on this server");
+  $("#rr").disabled = !h.rerank_enabled;
+}).catch(() => { $("#info").textContent = "API unreachable"; });
+
+function params(extra = {}) {
+  const fd = new FormData($("#f")), p = new URLSearchParams();
+  if (fd.get("q").trim()) p.set("q", fd.get("q").trim());
+  for (const c of fd.get("cpc").split(",")) if (c.trim()) p.append("cpc", c.trim());
+  for (const w of fd.get("kw").split(",")) if (w.trim()) p.append("kw", w.trim());
+  p.set("mode", fd.get("mode")); p.set("k", fd.get("k"));
+  if (fd.get("rerank")) p.set("rerank", "true");
+  for (const [key, v] of Object.entries(extra)) { p.delete("q"); p.set(key, v); }
+  return p;
+}
+
+async function run(extra) {
+  const my = ++seq;
+  if (ctrl) ctrl.abort();
+  ctrl = new AbortController();
+  $("#meta").textContent = "Searching…";
+  try {
+    const r = await fetch("api/search?" + params(extra), { signal: ctrl.signal });
+    const j = await r.json();
+    if (my !== seq) return;                       // a newer search started; drop this one
+    if (!r.ok) throw new Error(j.detail?.[0]?.msg || j.detail || r.statusText);
+    render(j, extra?.like ? `Patents similar to ${extra.like} · ` : "");
+  } catch (e) {
+    if (e.name === "AbortError" || my !== seq) return;
+    $("#meta").innerHTML = `<span class="err">${esc(e.message)}</span>`;
+    $("#out").innerHTML = "";
+  }
+}
+
+function render(j, label = "") {
+  const t = j.timings_ms, stages = Object.entries(t).filter(([k]) => k !== "total")
+    .map(([k, v]) => `${k} ${v.toFixed(1)}`).join(" · ");
+  $("#meta").textContent = `${label}${j.results.length} results from ${j.n_candidates} candidates · ` +
+    `${j.mode} · filters: ${j.filters} · ${t.total.toFixed(0)} ms (${stages})`;
+  $("#out").innerHTML = j.results.map(r => {
+    const sc = ["score","dense","bm25","rerank_score"].filter(k => r[k] != null).map(k => `${k} ${r[k]}`).join(" · ");
+    const moved = r.stage1_rank ? ` · was #${r.stage1_rank}` : "";
+    const mc = r.matched_claim ? `<div class="claim"><b>Claim ${r.matched_claim.claim_no}</b>` +
+      (r.matched_claim.score != null ? ` (${r.matched_claim.score})` : "") +
+      `: ${esc(r.matched_claim.text.slice(0, 420))}${r.matched_claim.text.length > 420 ? "…" : ""}</div>` : "";
+    const terms = r.terms_in_title_abstract?.length ? `<div class="terms">terms in title/abstract: ${esc(r.terms_in_title_abstract.join(", "))}</div>` : "";
+    return `<div class="res"><div class="top"><span class="rank">#${r.rank}</span>
+      <span>${esc(r.doc_number)}</span><span class="tag">${esc(r.cpc)}</span><span>${esc(r.week)}</span>
+      <span>${sc}${moved}</span>
+      <a data-like="${esc(r.doc_number)}">more like this</a></div>
+      <div class="title">${esc(r.title)}</div>${mc}${terms}</div>`;
+  }).join("") || "<div class='res'>No results.</div>";
+}
+
+$("#f").addEventListener("submit", (e) => { e.preventDefault(); run(); });
+$("#out").addEventListener("click", (e) => {
+  const d = e.target.dataset.like; if (d) { window.scrollTo(0, 0); run({ like: d }); }
+});
+</script>
+</body>
+</html>
