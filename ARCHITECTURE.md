@@ -17,16 +17,17 @@ flowchart LR
         DATA["data.py ✅<br/>load · clean · chunk"]
         BUILD["build_index.py ✅<br/>embed chunks"]
         CACHE[("cache/&lt;model&gt;/ ✅<br/>embeddings.npy<br/>chunks.jsonl<br/>patents.json<br/>manifest.json")]
+        EXPORT["export_index.py ✅<br/>512-d float16 bundle, 10.7 MB"]
         TRAIN["future: fine-tune / eval 💭<br/>(uses GPU)"]
-        RAW --> DATA --> BUILD --> CACHE
+        RAW --> DATA --> BUILD --> CACHE --> EXPORT
     end
 
     subgraph RAYA["Raya — Docker, CPU only"]
-        NGINX["nginx reverse proxy ⬜<br/>TLS · basic auth / user allowlist · rate limit"]
+        NGINX["nginx 🟡 (written, not deployed)<br/>basic auth · optional allowlist · rate limit"]
         WEB["Patent Explorer ✅<br/>React UI (linked views) + FastAPI /api"]
         PRES["presentation page ⬜<br/>static: write-up, diagrams, benchmarks"]
-        SEARCH["search.py ✅ (engine + CLI)<br/>filter → dense + BM25 → fuse<br/>rerank ⬜"]
-        RCACHE[("index cache<br/>read-only copy")]
+        SEARCH["SearchEngine ✅<br/>filter → dense + BM25 → fuse<br/>rerank ✅ (opt-in)"]
+        RCACHE[("index bundle<br/>read-only volume")]
         VERIFY["LLM verify 💭<br/>claim-by-claim check"]
         FB[("feedback store ⬜<br/>SQLite")]
         NGINX --> WEB
@@ -36,7 +37,7 @@ flowchart LR
     end
 
     USER(("Reviewer<br/>browser")) --> NGINX
-    CACHE -- "rsync / scp<br/>(gitignored, not committed)" --> RCACHE
+    EXPORT -- "scp tar.gz<br/>(gitignored, not committed)" --> RCACHE
     FB -. "export labelled pairs" .-> TRAIN
     TRAIN -. "new model → rebuild index" .-> BUILD
 ```
@@ -64,7 +65,9 @@ flowchart TD
 
 ---
 
-## 3. Query pipeline — ✅ built as `search.py` (steps 1–5 and the explain step); rerank and verify ⬜
+## 3. Query pipeline — ✅ built (`search.py`); rerank ✅ opt-in; verify 💭
+
+This is `SearchEngine.search()`, used by the CLI, `/api/search` and the evaluations. The UI's `explore()` differs on purpose; see §3b.
 
 ```mermaid
 sequenceDiagram
@@ -85,7 +88,7 @@ sequenceDiagram
     S->>S: 3. dense score = embeddings[allowed] @ q
     S->>S: 4. BM25 score over the same allowed patents
     S->>S: 5. fuse ranks with Reciprocal Rank Fusion → top 100
-    S->>R: 6. rerank (query, best claim) pairs → top 30   [Part 3]
+    S->>R: 6. optional rerank of (query, best claim) pairs → top 30 [Part 3a]
     R-->>S: reranked list
     S-->>W: results: patent metadata + matched claim + scores
     W-->>U: results page
@@ -97,9 +100,38 @@ sequenceDiagram
 ```
 
 **Points that matter for the hybrid-search timing question:**
-- **Filtering happens before scoring (pre-filtering).** A filter that keeps 10% of patents cuts the dense step to 10% of the rows, so hybrid search ends up *faster* than plain search. `bench.py` will measure it.
+- **Filtering happens before scoring (pre-filtering).** A filter that keeps 10% of patents cuts the dense step to 10% of the rows, so hybrid search ends up *faster* than plain search. `bench.py` measures this; see §7.
 - **An exact title search never calls the model.** It's a dictionary lookup.
 - **We stay with brute-force numpy search.** 11K × 1024 floats is about 46 MB, and one matrix multiply over that takes milliseconds. An approximate index (FAISS/HNSW) only pays off at around 1M+ vectors; see `DESIGN.md` for the 10M-patent version.
+
+## 3b. Linked-views query (`/api/explore`, the UI) — ✅ built
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant C as Patent Explorer (React)
+    participant A as /api/explore
+    participant E as SearchEngine.explore()
+    U->>C: change a filter (chip, CPC row, timeline drag)
+    C->>C: state → URL hash, abort the in-flight request, rid = n+1
+    alt this filter state was seen before
+        C->>C: render from the client cache (~7 ms)
+    else new state
+        C->>A: GET /api/explore?q, cpc, kw, week_from/to, rid
+        A->>E: explore(query, filters)
+        E->>E: match set M = query's top 200 over the WHOLE corpus
+        E->>E: M_f = M ∩ filters (a subset, never re-ranked)
+        E->>E: results page + CPC counts + week counts, all from M_f
+        E-->>A: one payload
+        A-->>C: payload + rid echoed
+        C->>C: render only if rid is still the latest
+    end
+    C-->>U: all three views from that one payload (~36 ms total)
+```
+
+- **Why a fixed match set:** if "results" meant the top N *after* filtering, clicking a CPC bar of 80 could return 200, and the views would disagree. Filters only ever select a subset of M, so a bar's count is exactly what clicking it returns. `test_explore.py` checks this.
+- **Why views render from the state that produced the data:** while a request is in flight the requested state is ahead of the data. The chips show the request; the views (dimmed) show the data and *its* state, so they never mix the two.
 
 ---
 
@@ -111,7 +143,7 @@ valuable kind of training data.
 
 ```mermaid
 flowchart LR
-    Q["query"] --> RANK["ranked result #k"]
+    Q["query"] --> RANK["ranked result k"]
     RANK --> V{"LLM verify<br/>relevant?"}
     V -->|"yes, rank ok"| POS[("positive pair<br/>(query, doc)")]
     V -->|"no, but ranked high"| NEG[("hard negative<br/>(query, doc, rank, scores)")]
@@ -145,30 +177,31 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    NET(("internet")) -->|"443"| NGINX
+    NET(("browser")) -->|"host :8080 (TLS via a host proxy, optional)"| NGINX
     subgraph DOCKER["docker compose on Raya"]
-        NGINX["nginx<br/>auth_basic + allow/deny<br/>limit_req on /api/verify"]
-        APP["app container<br/>python:3.12-slim + CPU torch<br/>FastAPI / uvicorn"]
-        VOL[("volume: ./cache (read-only)<br/>volume: ./feedback.db")]
-        NGINX -->|"/ and /api"| APP
-        NGINX -->|"/present"| STATIC["presentation (static files)"]
+        NGINX["nginx<br/>auth_basic (+ optional allow/deny)<br/>limit_req 2 r/s on /api/ · noindex"]
+        APP["app container<br/>python:3.12-slim + CPU torch<br/>uvicorn: built UI at / + /api"]
+        VOL[("./index (read-only bundle)<br/>hf-cache volume (model weights)")]
+        NGINX -->|"/ and /api/"| APP
         APP --- VOL
     end
+    PRESF["presentation page ⬜<br/>(planned: /present/)"] -.-> NGINX
 ```
 
-- **The image ships the code and CPU-only PyTorch.** The index cache is mounted as a volume rather than baked into the image, so a rebuild on the laptop just means syncing a folder.
-- **The container downloads the embedding model on its first start** (or it's baked into the image). It must be the **same model id and query prompt** as `manifest.json`; the app should refuse to start on a mismatch.
+- **The image ships the code, the pre-built UI (`app/static/`) and CPU-only PyTorch, with no Node.** The index bundle is mounted read-only rather than baked into the image, so shipping a new index means copying one folder and restarting `app`.
+- **The model is downloaded on first start into the `hf-cache` volume.** It must be the **same model id and query prompt** as `manifest.json`: `SearchEngine.model()` raises on a mismatch, and the app loads the model at startup, so a mismatched bundle fails fast.
+- **`ALLOW_DEBUG_DELAY` stays off on the server.** It exists only to demo the UI's stale-result guard.
 - **Rough memory:** Qwen3-Embedding-0.6B in fp32 needs about 2.4 GB of RAM, plus about 50 MB of index.
 
 **Raya's budget.** Raya is a free Hostinger staging box in Boston: 16 GB RAM, 4 vCPU, 200 GB NVMe. It must stay lightly used.
 
 | item | budget / choice |
 |---|---|
-| Upload from laptop | **under 30 MB**, once per index rebuild. Ship a slim export: no description text, float16 vectors, gzipped. |
+| Upload from laptop | **10.7 MB** tar.gz (`export_index.py`: 512-d float16, no description text), once per index rebuild |
 | Model weights | downloaded by Raya directly from Hugging Face, once: MiniLM about 90 MB, Qwen3-0.6B about 1.2 GB |
 | RAM at rest | MiniLM about 0.5 GB; Qwen3 about 3 GB (out of 16) |
-| Query embedding | CPU only: MiniLM about 10 ms; Qwen3 roughly 0.1–0.5 s (to be measured) |
-| Reranker | `ms-marco-MiniLM-L-6` on the top 30–50 (about 1 s on CPU). `bge-reranker-v2-m3` is too heavy for 4 vCPU. |
+| Query embedding | CPU only: MiniLM about 10 ms; Qwen3 about 100–160 ms on the laptop (re-measure on Raya with `deploy/README.md` step 5) |
+| Reranker | off by default (`ENABLE_RERANK=0`). `ms-marco-MiniLM-L-6` measured 2.4–3.2 s per query on 4 threads with no quality gain; `bge-reranker-v2-m3` took 631 s on 4 threads, so it's not viable without a GPU |
 | LLM verify | not on Raya: Claude API (rate-limited) or turned off |
 | Traffic | behind nginx auth, so only whitelisted reviewers, and nothing runs in the background |
 
@@ -205,17 +238,23 @@ flowchart TB
 | `patents.json` | `doc_number, title, abstract, claims[], description[], classification, cpc{section, class, subclass, group, display}, week, source_file, missing[]` |
 | `manifest.json` | `model_id`, `query_prompt`, `dim`, `max_seq_length`, counts, `load_report`, `timings_s`, machine info |
 
+**The server bundle** (`deploy/index/<model>/`, written by `export_index.py`) has the same four files, slimmed:
+- `embeddings.npy` is **float16 at 512 dimensions** (Matryoshka truncation, re-normalised), and `manifest.json` records `dim: 512` and `full_dim: 1024`. `SearchEngine` truncates query vectors to match.
+- Canceled-claim rows are dropped and `chunk_id`s renumbered.
+- `chunks.jsonl` has no `text`; `SearchEngine.chunk_text()` rebuilds it from `patents.json`.
+- `patents.json` has no `description`.
+
 ---
 
 ## 7. Facts measured so far
 
 - **Small set:** 64 files, 640 patents, no duplicate `doc_number`s, no unreadable files.
-- **Chunks:** 11,218 in total, i.e. 640 patent chunks plus 10,578 claim chunks.
+- **Chunks:** 11,218 in the saved caches (640 patent chunks plus 10,578 claim chunks). A fresh build gives 11,051, because canceled claims are now skipped at chunking.
 - **Missing data:** 119 patents (19%) have an **empty description** (`[""]`). They're kept, since descriptions aren't embedded by default.
 - **Dependent claims:** about 67% of claims reference another claim.
 - **Canceled claims:** 167 claims across 25 patents are withdrawn placeholders (`(canceled)`, `1 - 15. (canceled)`). They're kept in `claims[]` so claim numbering stays intact, but they're never embedded or shown as a match (`data.is_canceled`). Older caches are filtered at search time.
 - **Claim 1 is truncated in the data:** its preamble is stripped (e.g. it starts "an axle body, …").
-- **Classification codes** look like `B60B104FI`, which we parse as `B60B 1/04` plus the suffix `FI`. That's inferred from the format, so filters use the raw prefix.
+- **Classification codes** look like `B60B104FI`, with the space and slash dropped, so the split is inferred: 3 digits = 1+2 (`1/04`), 4 = 2+2 (`27/00`), 5 = 2+3 (`15/024`). Bare prefixes like `B60B` filter on the raw code; `B60C 23/` filters on the parsed form. The full dataset has 3-digit main groups in other classes and would need a CPC lookup table.
 - **Index build timings (11,218 chunks):**
 
   | model | device | time | rate | vectors | cache folder |
@@ -252,7 +291,7 @@ flowchart TB
     | 10% pass | 16 ms | **30 ms** | 2.1 ms |
     | 1% pass | 16 ms | 3.3 ms | 0.65 ms |
 
-    Copying the passing rows out of a big matrix can cost *more* than scoring everything.
+    Copying the passing rows out of a big matrix can cost *more* than scoring everything. Storing vectors **grouped by CPC subclass** turns a filter into a contiguous slice, which is 8–25× faster than post-filtering. At 10M patents this becomes "partition / shard the index by classification" (see `DESIGN.md`).
 - **End-to-end smoke test** (`smoke_test.py` against the running API; [results/smoke_127_0_0_1.md](results/smoke_127_0_0_1.md)): **PASS**.
   - **Known items:** 12 patents described in my own words, avoiding title words. Dense finds 10/12 at #1 and 12/12 in the top 3. Hybrid (w = 0.1) finds 8/12 at #1, 11/12 in the top 3, and 12/12 in the top 10.
   - **Self-retrieval over all 640 patents:**
@@ -260,7 +299,7 @@ flowchart TB
     - **By first claim:** 618/640 at #1. The 3 that fall outside the top 10 have claim 1 cut down to a bare list of parts, because the data strips the preamble ("a stem member…; a wheel…").
   - **Filters:** 0 violations across 5 checks.
   - **"More like this":** never returns the source patent, and 63% of neighbours share its CPC main group.
-  - **Latency:** p50 25 ms, p95 740 ms on laptop CPU. Long abstract-length queries are the slow ones.
+  - **Latency:** p50 25 ms; p95 0.7–1.4 s on laptop CPU across runs (higher when the browser was running alongside). Long abstract-length queries are the slow ones.
 - **BM25 weight in hybrid fusion** ([results/hybrid_weight_sweep.md](results/hybrid_weight_sweep.md)):
   - **The problem:** equal weights let BM25 drag dense #1 hits down to #15–#23 on paraphrased queries.
   - **The sweep:** hand-written descriptions do best at w = 0, with MRR 0.92 (0.56 at w = 1). Claim queries do best at w = 0.1–0.25, with nDCG@10 0.548 (0.539 at w = 0 and 0.520 at w = 1).
@@ -271,7 +310,7 @@ flowchart TB
   |---|---|---|---|---|---|
   | BM25 | 0.376 | 0.418 | 0.668 | 0.247 | – |
   | dense (Qwen3) | **0.509** | **0.540** | 0.715 | **0.322** | – |
-  | hybrid (dense + BM25, RRF) | 0.489 | 0.528 | **0.744** | 0.314 | – |
+  | hybrid (dense + BM25, RRF, old w = 1.0) | 0.489 | 0.528 | **0.744** | 0.314 | – |
   | hybrid + MiniLM (100 candidates, 512 tokens) | 0.433 | 0.460 | 0.655 | 0.278 | 4.5 s (12 threads) |
   | hybrid + MiniLM (50 candidates, 256 tokens; Raya setup) | 0.456 | 0.487 | 0.679 | 0.302 | 3.2 s (4 threads) |
   | **fix 1:** hybrid + MiniLM, ranks merged with stage 1 (RRF) | 0.490 | 0.513 | 0.674 | 0.311 | 3.2 s |
@@ -298,7 +337,7 @@ flowchart TB
   - **Still open:**
     - bge-reranker-v2-m3 on the GPU
     - fine-tuning the reranker on silver or feedback pairs (§4), i.e. adapting it to the domain instead of using a web-search model as is
-    - better labels: citations, or examiner-style judgments on a small hand-labelled set Storing vectors **grouped by CPC subclass** turns a filter into a contiguous slice, which is 8–25× faster than post-filtering. At 10M patents this becomes "partition / shard the index by classification" (see `DESIGN.md`).
+    - better labels: citations, or examiner-style judgments on a small hand-labelled set
 - **Sanity query** "tire with a sensor that monitors air pressure":
   - **Qwen3's** top 3 are tread-wear sensing (B60C 11/24), tire management (B60C 23/04) and leak detection (B60C 23/00), so 2 of 3 are pressure-related.
   - **MiniLM's** top 3 are 2× tread-wear monitoring and a sensor-container assembly.
